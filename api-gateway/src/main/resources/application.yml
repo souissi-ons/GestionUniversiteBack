@@ -1,0 +1,53 @@
+server:
+  port: 8888
+
+spring:
+  application:
+    name: api-gateway
+    
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOrigins:
+              - "http://localhost:4200"
+              - "http://localhost:3000"
+            allowedMethods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            allowedHeaders: "*"
+            allowCredentials: true
+            exposedHeaders: "Authorization"
+        add-to-simple-url-handler-mapping: true
+
+      routes:
+        - id: orchestrator-route
+          uri: http://orchestrator-service:8085
+          predicates:
+            - Path=/api/workflow/**
+
+        - id: reservation-service
+          uri: http://service-reservation:8082
+          predicates:
+            - Path=/api/reservations/**,/api/rooms/**,/api/equipments/**
+
+        - id: cursus-service
+          uri: http://service-cursus:8083
+          predicates:
+            - Path=/graphql/**,/graphiql/**
+          filters:
+            - PreserveHostHeader
+
+        - id: archives-service
+          uri: http://service-archives:8081
+          predicates:
+            - Path=/archives/**
+
+        - id: auth-service
+          uri: http://service-auth:8084
+          predicates:
+            - Path=/auth/**

@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # --- ORCHESTRATEUR ---
+  orchestrator-service:
+    build: ./orchestrator-service
+    container_name: orchestrator-service
+    ports:
+      - "8085:8085"
+    environment:
+      # On pointe vers les noms de conteneurs définis dans le DOSSIER A
+      - SERVICES_AUTH_URL=http://service-auth:8084/auth
+      - SERVICES_RESERVATION_URL=http://service-reservation:8082/api
+      - SERVICES_GRAPHQL_URL=http://service-cursus:8083/graphql
+      - SERVICES_SOAP_URL=http://service-archives:8081/archives
+      - GRPC_CLIENT_NOTIFICATION_SERVICE_ADDRESS=static://service-notification:9090
+    networks:
+      - university-network
+
+  # --- API GATEWAY ---
+  api-gateway:
+    build: ./api-gateway
+    container_name: api-gateway
+    ports:
+      - "8888:8888"
+    depends_on:
+      - orchestrator-service
+    networks:
+      - university-network
+
+# UTILISATION DU RÉSEAU EXISTANT
+networks:
+  university-network:
+    external: true
+    name: university-network

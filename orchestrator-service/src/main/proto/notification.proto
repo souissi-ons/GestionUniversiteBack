@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+option java_package = "com.university.notifications.stubs";
+option java_multiple_files = true;
+
+// Types
+enum NotificationType {
+  COURSE_CANCELLED = 0;
+  ROOM_CHANGED = 1;
+  GRADE_PUBLISHED = 2;
+  RESERVATION_CONFIRMED = 3;
+  URGENT_ALERT = 4;
+  GENERAL_INFO = 5;
+}
+
+enum Priority {
+  LOW = 0;
+  NORMAL = 1;
+  HIGH = 2;
+  URGENT = 3;
+}
+
+message Notification {
+  string id = 1;
+  string userId = 2;
+  string title = 3;
+  string message = 4;
+  NotificationType type = 5;
+  Priority priority = 6;
+  bool read = 7;
+  string timestamp = 8; // Ajout date ISO
+}
+
+// 1. UNARY : Envoyer une notif
+message SendNotificationRequest {
+  string userId = 1;
+  string title = 2;
+  string message = 3;
+  NotificationType type = 4;
+  Priority priority = 5;
+}
+message SendNotificationResponse {
+  string notificationId = 1;
+  bool success = 2;
+  string message = 3;
+}
+
+// 2. SERVER STREAMING : S'abonner aux flux
+message SubscribeRequest {
+  string userId = 1;
+}
+
+// 3. CLIENT STREAMING : Envoi en masse
+message BatchNotificationResponse {
+  int32 countSuccess = 1;
+  string status = 2;
+}
+
+// 4. BI-DIRECTIONAL : Marquer comme lu en flux continu
+message AckRequest {
+  string notificationId = 1;
+  string userId = 2;
+}
+message AckResponse {
+  string status = 1;
+  int32 unreadCount = 2;
+}
+
+service NotificationService {
+  rpc SendNotification(SendNotificationRequest) returns (SendNotificationResponse);
+  rpc SubscribeToNotifications(SubscribeRequest) returns (stream Notification);
+  rpc SendBatchNotifications(stream SendNotificationRequest) returns (BatchNotificationResponse);
+  rpc SyncNotifications(stream AckRequest) returns (stream AckResponse);
+}
