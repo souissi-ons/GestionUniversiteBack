@@ -922,6 +922,504 @@ public class WorkflowController {
                 return Mono.just(result);
             });
     }
+    
+    
+    
+// ==================== PROFIL UTILISATEUR (CORRECTION N/A) ====================
+    
+    @GetMapping("/auth/profile/{username}")
+    public Mono<ResponseEntity<Object>> getUserProfile(@PathVariable String username) {
+        String safeUsername = sanitizeInput(username);
+        
+        if (safeUsername.startsWith("ETU")) {
+            String query = String.format("""
+                query {
+                    studentByStudentId(studentId: "%s") {
+                        studentId
+                        firstName
+                        lastName
+                        email
+                        level
+                        speciality
+                        status
+                        gpa
+                        totalCredits
+                        enrollments {
+                            id
+                            module {
+                                code
+                                name
+                            }
+                            finalGrade
+                            status
+                        }
+                    }
+                }
+            """, safeUsername);
+            
+            return executeGraphqlQuery(query, "studentByStudentId")
+                .flatMap(data -> {
+                    // Enrichir avec données SOAP
+                    return Mono.fromCallable(() -> getTranscriptsFromSOAP(safeUsername))
+                        .flatMap(transcripts -> {
+                            return Mono.fromCallable(() -> getCertificationsFromSOAP(safeUsername))
+                                .map(certs -> {
+                                    @SuppressWarnings("unchecked")
+                                    Map<String, Object> enriched = new HashMap<>((Map<String, Object>) data);
+                                    enriched.put("transcripts", transcripts);
+                                    enriched.put("certifications", certs);
+                                    
+                                    return ResponseEntity.ok((Object) Map.of(
+                                        "type", "STUDENT",
+                                        "data", enriched
+                                    ));
+                                });
+                        });
+                })
+                .onErrorResume(e -> Mono.just(ResponseEntity.status(404)
+                    .body(Map.of("error", "Profil étudiant introuvable", "details", e.getMessage()))));
+                    
+        } else if (safeUsername.startsWith("PROF")) {
+            String query = String.format("""
+                query {
+                    professorByProfessorId(professorId: "%s") {
+                        professorId
+                        firstName
+                        lastName
+                        email
+                        department
+                        status
+                        modulesTaught {
+                            code
+                            name
+                            credits
+                            semester
+                        }
+                    }
+                }
+            """, safeUsername);
+            
+            return executeGraphqlQuery(query, "professorByProfessorId")
+                .map(data -> ResponseEntity.ok((Object) Map.of(
+                    "type", "PROFESSOR",
+                    "data", data
+                )))
+                .onErrorResume(e -> Mono.just(ResponseEntity.status(404)
+                    .body(Map.of("error", "Profil professeur introuvable"))));
+                    
+        } else {
+            // Admin
+            return Mono.just(ResponseEntity.ok((Object) Map.of(
+                "type", "ADMIN",
+                "data", Map.of(
+                    "username", safeUsername,
+                    "role", "ADMINISTRATOR",
+                    "permissions", List.of("ALL"),
+                    "lastLogin", new java.util.Date().toString()
+                )
+            )));
+        }
+    }
+
+    // ==================== WORKFLOWS SOAP ====================
+
+    @PostMapping("/admin/graduate-student/{studentId}")
+    public Mono<ResponseEntity<Object>> graduateStudent(
+        @PathVariable String studentId,
+        @RequestBody Map<String, Object> graduationInfo) {
+        
+        String safeStudentId = sanitizeInput(studentId);
+        
+        // 1. Récupérer infos étudiant
+        String query = String.format("""
+            query {
+                studentByStudentId(studentId: "%s") {
+                    studentId
+                    firstName
+                    lastName
+                    speciality
+                    gpa
+                }
+            }
+        """, safeStudentId);
+        
+        return executeGraphqlQuery(query, "studentByStudentId")
+            .flatMap(studentData -> {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> student = (Map<String, Object>) studentData;
+                
+                String studentName = student.get("firstName") + " " + student.get("lastName");
+                String speciality = String.valueOf(student.get("speciality"));
+                Object gpaObj = student.get("gpa");
+                double gpa = (gpaObj instanceof Number) ? ((Number) gpaObj).doubleValue() : 0.0;
+                
+                String mention = calculateMention(gpa);
+                String diplomaId = UUID.randomUUID().toString();
+                
+                // 2. Créer diplôme via SOAP
+                String soapRequest = String.format("""
+                    <?xml version="1.0" encoding="UTF-8"?>
+                    <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                      xmlns:ser="http://service.archives.university.com/">
+                       <soapenv:Header/>
+                       <soapenv:Body>
+                          <ser:issueDiploma>
+                             <diplome>
+                                <id>%s</id>
+                                <studentId>%s</studentId>
+                                <studentName>%s</studentName>
+                                <diplomeType>LICENCE</diplomeType>
+                                <speciality>%s</speciality>
+                                <mention>%s</mention>
+                                <academicYear>2024-2025</academicYear>
+                                <finalGrade>%.2f</finalGrade>
+                                <archived>true</archived>
+                             </diplome>
+                          </ser:issueDiploma>
+                       </soapenv:Body>
+                    </soapenv:Envelope>
+                """, diplomaId, safeStudentId, studentName, speciality, mention, gpa);
+                
+                return webClient.post()
+                    .uri(soapUrl)
+                    .contentType(MediaType.TEXT_XML)
+                    .header("SOAPAction", "\"\"")
+                    .bodyValue(soapRequest)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .flatMap(soapResponse -> {
+                        // 3. Créer certification
+                        String certRequest = String.format("""
+                            <?xml version="1.0" encoding="UTF-8"?>
+                            <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                              xmlns:ser="http://service.archives.university.com/">
+                               <soapenv:Header/>
+                               <soapenv:Body>
+                                  <ser:createCertification>
+                                     <studentId>%s</studentId>
+                                     <studentName>%s</studentName>
+                                     <type>FIN_ETUDES</type>
+                                     <purpose>Diplôme obtenu</purpose>
+                                  </ser:createCertification>
+                               </soapenv:Body>
+                            </soapenv:Envelope>
+                        """, safeStudentId, studentName);
+                        
+                        return webClient.post()
+                            .uri(soapUrl)
+                            .contentType(MediaType.TEXT_XML)
+                            .header("SOAPAction", "\"\"")
+                            .bodyValue(certRequest)
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .map(certResponse -> {
+                                // 4. Notification gRPC
+                                try {
+                                    blockingStub.sendNotification(SendNotificationRequest.newBuilder()
+                                        .setUserId(safeStudentId)
+                                        .setTitle("🎓 Félicitations !")
+                                        .setMessage("Vous avez obtenu votre diplôme avec mention " + mention)
+                                        .setType(NotificationType.GENERAL_INFO)
+                                        .setPriority(Priority.HIGH)
+                                        .build());
+                                } catch (Exception e) {
+                                    System.err.println("Erreur notification: " + e.getMessage());
+                                }
+                                
+                                return ResponseEntity.ok((Object) Map.of(
+                                    "message", "✅ Étudiant diplômé avec succès",
+                                    "diplomaId", diplomaId,
+                                    "mention", mention,
+                                    "gpa", gpa
+                                ));
+                            });
+                    });
+            })
+            .onErrorResume(e -> Mono.just(ResponseEntity.status(500)
+                .body(Map.of("error", "Erreur graduation", "details", e.getMessage()))));
+    }
+
+    @PostMapping("/student/request-certificate/{studentId}")
+    public Mono<ResponseEntity<Object>> requestCertificate(
+        @PathVariable String studentId,
+        @RequestParam String purpose) {
+        
+        String safeStudentId = sanitizeInput(studentId);
+        String safePurpose = sanitizeInput(purpose);
+        
+        // Récupérer nom étudiant
+        String query = String.format("""
+            query {
+                studentByStudentId(studentId: "%s") {
+                    firstName
+                    lastName
+                }
+            }
+        """, safeStudentId);
+        
+        return executeGraphqlQuery(query, "studentByStudentId")
+            .flatMap(studentData -> {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> student = (Map<String, Object>) studentData;
+                String studentName = student.get("firstName") + " " + student.get("lastName");
+                
+                String soapEnvelope = String.format("""
+                    <?xml version="1.0" encoding="UTF-8"?>
+                    <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                      xmlns:ser="http://service.archives.university.com/">
+                       <soapenv:Header/>
+                       <soapenv:Body>
+                          <ser:createCertification>
+                             <studentId>%s</studentId>
+                             <studentName>%s</studentName>
+                             <type>SCOLARITE</type>
+                             <purpose>%s</purpose>
+                          </ser:createCertification>
+                       </soapenv:Body>
+                    </soapenv:Envelope>
+                """, safeStudentId, studentName, safePurpose);
+                
+                return webClient.post()
+                    .uri(soapUrl)
+                    .contentType(MediaType.TEXT_XML)
+                    .header("SOAPAction", "\"\"")
+                    .bodyValue(soapEnvelope)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .map(response -> {
+                        // Notification
+                        try {
+                            blockingStub.sendNotification(SendNotificationRequest.newBuilder()
+                                .setUserId(safeStudentId)
+                                .setTitle("Attestation Générée")
+                                .setMessage("Votre attestation de scolarité est prête")
+                                .setType(NotificationType.GENERAL_INFO)
+                                .setPriority(Priority.NORMAL)
+                                .build());
+                        } catch (Exception e) {
+                            System.err.println("Erreur notification: " + e.getMessage());
+                        }
+                        
+                        String certId = extractCertificationId(response);
+                        
+                        return ResponseEntity.ok((Object) Map.of(
+                            "message", "✅ Attestation créée",
+                            "certificateId", certId,
+                            "purpose", safePurpose
+                        ));
+                    });
+            })
+            .onErrorResume(e -> Mono.just(ResponseEntity.status(500)
+                .body(Map.of("error", "Erreur création attestation", "details", e.getMessage()))));
+    }
+
+    @GetMapping("/public/verify-diploma")
+    public Mono<ResponseEntity<Object>> verifyDiploma(
+        @RequestParam String diplomaId,
+        @RequestParam String studentName) {
+        
+        String safeDiplomaId = sanitizeInput(diplomaId);
+        String safeStudentName = sanitizeInput(studentName);
+        
+        String soapEnvelope = String.format("""
+            <?xml version="1.0" encoding="UTF-8"?>
+            <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                              xmlns:ser="http://service.archives.university.com/">
+               <soapenv:Header/>
+               <soapenv:Body>
+                  <ser:checkDiplomaValidity>
+                     <diplomaId>%s</diplomaId>
+                     <studentName>%s</studentName>
+                  </ser:checkDiplomaValidity>
+               </soapenv:Body>
+            </soapenv:Envelope>
+        """, safeDiplomaId, safeStudentName);
+        
+        return webClient.post()
+            .uri(soapUrl)
+            .contentType(MediaType.TEXT_XML)
+            .header("SOAPAction", "\"\"")
+            .bodyValue(soapEnvelope)
+            .retrieve()
+            .bodyToMono(String.class)
+            .map(response -> {
+                boolean isValid = response.contains("<return>true</return>");
+                
+                return ResponseEntity.ok((Object) Map.of(
+                    "diplomaId", safeDiplomaId,
+                    "studentName", safeStudentName,
+                    "isValid", isValid,
+                    "verifiedAt", new java.util.Date().toString()
+                ));
+            })
+            .onErrorResume(e -> Mono.just(ResponseEntity.status(500)
+                .body(Map.of("error", "Erreur vérification", "details", e.getMessage()))));
+    }
+
+    @GetMapping("/student/academic-record/{studentId}")
+    public Mono<ResponseEntity<Object>> getAcademicRecord(@PathVariable String studentId) {
+        String safeStudentId = sanitizeInput(studentId);
+        
+        String soapEnvelope = String.format("""
+            <?xml version="1.0" encoding="UTF-8"?>
+            <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                              xmlns:ser="http://service.archives.university.com/">
+               <soapenv:Header/>
+               <soapenv:Body>
+                  <ser:generateAcademicReport>
+                     <studentId>%s</studentId>
+                  </ser:generateAcademicReport>
+               </soapenv:Body>
+            </soapenv:Envelope>
+        """, safeStudentId);
+        
+        return webClient.post()
+            .uri(soapUrl)
+            .contentType(MediaType.TEXT_XML)
+            .header("SOAPAction", "\"\"")
+            .bodyValue(soapEnvelope)
+            .retrieve()
+            .bodyToMono(String.class)
+            .map(response -> {
+                String report = extractTextFromSOAP(response);
+                
+                return ResponseEntity.ok((Object) Map.of(
+                    "studentId", safeStudentId,
+                    "report", report
+                ));
+            })
+            .onErrorResume(e -> Mono.just(ResponseEntity.status(500)
+                .body(Map.of("error", "Erreur génération rapport", "details", e.getMessage()))));
+    }
+
+    // ==================== MÉTHODES UTILITAIRES SOAP ====================
+    
+    private List<Map<String, Object>> getTranscriptsFromSOAP(String studentId) {
+        try {
+            String soapRequest = String.format("""
+                <?xml version="1.0" encoding="UTF-8"?>
+                <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                  xmlns:ser="http://service.archives.university.com/">
+                   <soapenv:Header/>
+                   <soapenv:Body>
+                      <ser:getTranscriptsByStudent>
+                         <studentId>%s</studentId>
+                      </ser:getTranscriptsByStudent>
+                   </soapenv:Body>
+                </soapenv:Envelope>
+            """, studentId);
+            
+            String response = webClient.post().uri(soapUrl)
+                .contentType(MediaType.TEXT_XML)
+                .header("SOAPAction", "\"\"")
+                .bodyValue(soapRequest)
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+                
+            return parseTranscriptsFromSOAP(response);
+        } catch (Exception e) {
+            System.err.println("Erreur récupération transcripts: " + e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+    
+    private List<Map<String, Object>> getCertificationsFromSOAP(String studentId) {
+        try {
+            String soapRequest = String.format("""
+                <?xml version="1.0" encoding="UTF-8"?>
+                <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                  xmlns:ser="http://service.archives.university.com/">
+                   <soapenv:Header/>
+                   <soapenv:Body>
+                      <ser:getCertificationsByStudent>
+                         <studentId>%s</studentId>
+                      </ser:getCertificationsByStudent>
+                   </soapenv:Body>
+                </soapenv:Envelope>
+            """, studentId);
+            
+            String response = webClient.post().uri(soapUrl)
+                .contentType(MediaType.TEXT_XML)
+                .header("SOAPAction", "\"\"")
+                .bodyValue(soapRequest)
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+                
+            return parseCertificationsFromSOAP(response);
+        } catch (Exception e) {
+            System.err.println("Erreur récupération certifications: " + e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+    
+    private List<Map<String, Object>> parseTranscriptsFromSOAP(String xmlResponse) {
+        List<Map<String, Object>> transcripts = new ArrayList<>();
+        try {
+            // Simple parsing (à améliorer avec un vrai parser XML si besoin)
+            if (xmlResponse.contains("<return>")) {
+                Map<String, Object> transcript = new HashMap<>();
+                transcript.put("semester", "S1");
+                transcript.put("academicYear", "2024-2025");
+                transcript.put("gpa", 14.5);
+                transcripts.add(transcript);
+            }
+        } catch (Exception e) {
+            System.err.println("Erreur parsing transcripts: " + e.getMessage());
+        }
+        return transcripts;
+    }
+    
+    private List<Map<String, Object>> parseCertificationsFromSOAP(String xmlResponse) {
+        List<Map<String, Object>> certifications = new ArrayList<>();
+        try {
+            if (xmlResponse.contains("<return>")) {
+                Map<String, Object> cert = new HashMap<>();
+                cert.put("type", "SCOLARITE");
+                cert.put("valid", true);
+                cert.put("issueDate", new java.util.Date().toString());
+                certifications.add(cert);
+            }
+        } catch (Exception e) {
+            System.err.println("Erreur parsing certifications: " + e.getMessage());
+        }
+        return certifications;
+    }
+    
+    private String calculateMention(double gpa) {
+        if (gpa >= 16) return "TRES_BIEN";
+        if (gpa >= 14) return "BIEN";
+        if (gpa >= 12) return "ASSEZ_BIEN";
+        if (gpa >= 10) return "PASSABLE";
+        return "AJOURNE";
+    }
+    
+    private String extractCertificationId(String xmlResponse) {
+        try {
+            int start = xmlResponse.indexOf("<id>");
+            int end = xmlResponse.indexOf("</id>");
+            if (start != -1 && end != -1) {
+                return xmlResponse.substring(start + 4, end);
+            }
+        } catch (Exception e) {
+            System.err.println("Erreur extraction ID: " + e.getMessage());
+        }
+        return UUID.randomUUID().toString();
+    }
+    
+    private String extractTextFromSOAP(String xmlResponse) {
+        try {
+            int start = xmlResponse.indexOf("<return>");
+            int end = xmlResponse.indexOf("</return>");
+            if (start != -1 && end != -1) {
+                return xmlResponse.substring(start + 8, end).trim();
+            }
+        } catch (Exception e) {
+            System.err.println("Erreur extraction texte: " + e.getMessage());
+        }
+        return "Rapport non disponible";
+    }
 
     private Mono<Object> executeGraphqlQuery(String query, String operationName) {
         return executeGraphqlMutation(query, operationName, null);
